@@ -1,0 +1,97 @@
+# Builds the design-system MCP server and its data into one downloadable
+# artifact and publishes it as GitHub Release assets, so moodle-dev setups
+# download instead of cloning and running npm builds on developer machines.
+#
+# Lives in the mcp commit (rides the rebase) because push-triggered
+# workflows run from the workflow file at the pushed commit.
+name: Publish MCP artifacts
+
+on:
+  push:
+    branches: [mcp]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-mcp
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mcp
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the data the MCP indexes
+        run: |
+          npm run build-tokens
+          npm run build-component-index
+
+      - name: Bundle the MCP server into a single file
+        # esbuild compiles the TypeScript entry and inlines
+        # @modelcontextprotocol/sdk, so consumers need no node_modules.
+        run: |
+          npx --yes esbuild@0.24.2 scripts/mcp-server.ts \
+            --bundle --platform=node --format=esm --target=node18 \
+            --outfile=dist-mcp/design-system-mcp/mcp-server.mjs
+
+      - name: Assemble the artifact directory
+        # The indexer reads, relative to --path: components/*/*.tsx and
+        # *.css (props, examples, token usage), dist/component-index.json,
+        # tokens/css/*.css and .github/instructions/*.instructions.md.
+        run: |
+          set -euo pipefail
+          OUT=dist-mcp/design-system-mcp
+          mkdir -p "$OUT/dist" "$OUT/tokens" "$OUT/.github"
+          cp dist/component-index.json "$OUT/dist/"
+          cp -R tokens/css "$OUT/tokens/css"
+          cp -R .github/instructions "$OUT/.github/instructions"
+          rsync -a --exclude '*.test.tsx' --exclude '*.stories.tsx.snap' components/ "$OUT/components/"
+          cd dist-mcp
+          tar -czf design-system-mcp.tar.gz design-system-mcp
+          sha256sum design-system-mcp.tar.gz > SHA256SUMS
+          ls -la
+          echo "DATE_TAG=mcp-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+
+      - name: Smoke test the bundled server
+        run: |
+          cd dist-mcp/design-system-mcp
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_token_categories","arguments":{}}}' \
+            | node mcp-server.mjs --path . | tee /tmp/smoke.out | tail -c 400
+          # The tool result is JSON embedded in a JSON string, so the quotes
+          # are backslash-escaped in the raw output.
+          grep -Eq 'tokenCount\\?": ?[1-9]' /tmp/smoke.out || { echo "::error::bundled server loaded no tokens"; exit 1; }
+
+      - name: Publish dated release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$DATE_TAG" dist-mcp/design-system-mcp.tar.gz dist-mcp/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "MCP artifacts $DATE_TAG" \
+            --notes "design-system-mcp.tar.gz: bundled mcp-server.mjs plus the component sources, tokens, component index and guidance it indexes. Run: node mcp-server.mjs --path <extracted dir>. Built from $GITHUB_SHA."
+
+      - name: Move the rolling mcp-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete mcp-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create mcp-latest dist-mcp/design-system-mcp.tar.gz dist-mcp/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "MCP artifacts (latest)" \
+            --notes "Rolling pointer to the newest build ($DATE_TAG). Pin a dated tag for reproducible setups."
