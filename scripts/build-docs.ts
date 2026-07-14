@@ -160,7 +160,11 @@ async function fetchPageContent(
     const raw = await invokeToolText(client, 'get-page', { pageId: page.id });
     const formatted = formatPage(stripExpiringImages(raw));
     if (formatted) {
-      sections.push(formatted);
+      // The page title is not part of the page body, but it IS the
+      // identity a reader (or the MCP guideline index) needs - the
+      // in-page headings are generic tab names ("Design", "Usage")
+      // that repeat on every page. Emit it as a marker comment.
+      sections.push(`<!-- page: ${page.title} -->\n\n${formatted}`);
     } else {
       console.log('    (skipped — no content)');
     }
